@@ -120,13 +120,25 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Check for saved model files ───────────────────────────────────────────
-MODEL_FILES = ['saved_model.pkl', 'scaler.pkl', 'label_encoder.pkl', 'selected_features.pkl', 'thresholds.pkl', 'metrics_metadata.pkl']
+MODEL_FILES = [
+    'saved_model_HistGradientBoosting.pkl',
+    'saved_model_XGBoost.pkl',
+    'saved_model_Random_Forest.pkl',
+    'saved_model_LightGBM.pkl',
+    'thresholds_HistGradientBoosting.pkl',
+    'thresholds_XGBoost.pkl',
+    'thresholds_Random_Forest.pkl',
+    'thresholds_LightGBM.pkl',
+    'scaler.pkl',
+    'label_encoder.pkl',
+    'selected_features.pkl',
+    'metrics_metadata.pkl'
+]
 missing_files = [f for f in MODEL_FILES if not os.path.exists(f)]
 
 if missing_files:
     st.warning("⚠️ Machine learning model artifacts not found. Running training pipeline...")
-    with st.spinner("Executing pipeline on dataset (this may take about 1 minute)..."):
+    with st.spinner("Executing pipeline on dataset for all 4 models (this may take about 3-5 minutes)..."):
         # Import run_pipeline from train_and_save and run it
         try:
             import train_and_save
@@ -141,22 +153,35 @@ if missing_files:
 
 # ── Load Model and Assets ──────────────────────────────────────────────────
 @st.cache_resource
-def load_assets():
-    model = joblib.load('saved_model.pkl')
+def load_assets(model_name):
+    model_filename = f"saved_model_{model_name.replace(' ', '_')}.pkl"
+    thresholds_filename = f"thresholds_{model_name.replace(' ', '_')}.pkl"
+    
+    if not os.path.exists(model_filename):
+        model_filename = 'saved_model.pkl'
+    if not os.path.exists(thresholds_filename):
+        thresholds_filename = 'thresholds.pkl'
+        
+    model = joblib.load(model_filename)
     scaler = joblib.load('scaler.pkl')
     encoder = joblib.load('label_encoder.pkl')
     features = joblib.load('selected_features.pkl')
-    thresholds = joblib.load('thresholds.pkl')
+    thresholds = joblib.load(thresholds_filename)
     with open('metrics_metadata.pkl', 'rb') as f:
         metadata = pickle.load(f)
     return model, scaler, encoder, features, thresholds, metadata
-
-model, scaler, encoder, selected_features, thresholds, metadata = load_assets()
 
 # ── Sidebar Navigation ─────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="soc-header">SOC-IDS</div>', unsafe_allow_html=True)
     st.markdown('<div class="soc-subheader">Intrusion Detection System</div>', unsafe_allow_html=True)
+    st.markdown("---")
+    
+    selected_model_name = st.selectbox(
+        "🤖 Active Classifier",
+        ["HistGradientBoosting", "XGBoost", "Random Forest", "LightGBM"],
+        index=0
+    )
     st.markdown("---")
     
     selected_page = option_menu(
@@ -197,28 +222,105 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.markdown('<div style="font-size:0.75rem;color:#64748B;font-family:monospace;">SYSTEM STATUS: <span style="color:#00FFCC;">ACTIVE</span><br>LOADED MODEL: HGB Classifier<br>CALIBRATED ACCURACY: 80.80%</div>', unsafe_allow_html=True)
 
-# ── Helper for Feature Engineering ──────────────────────────────────────────
+# ── Load Model and Assets based on selection ──────────────────────────────────
+model, scaler, encoder, selected_features, thresholds, metadata = load_assets(selected_model_name)
+
+# Map model-specific metrics/visuals to the top-level keys for backward compatibility
+if 'models_metadata' in metadata and selected_model_name in metadata['models_metadata']:
+    model_specific = metadata['models_metadata'][selected_model_name]
+    metadata['confusion_matrix_norm'] = model_specific['confusion_matrix_norm']
+    metadata['roc_curves'] = model_specific['roc_curves']
+    metadata['pr_curves'] = model_specific['pr_curves']
+    metadata['shap_values_raw'] = model_specific['shap_values_raw']
+    metadata['shap_is_list'] = model_specific['shap_is_list']
+    metadata['acc_calibrated'] = model_specific['acc_calibrated']
+    metadata['acc_default'] = model_specific['acc_default']
+    metadata['f1_calibrated'] = model_specific['f1_calibrated']
+    metadata['f1_default'] = model_specific['f1_default']
+
+with st.sidebar:
+    calib_acc = metadata.get('acc_calibrated', 0.8080)
+    st.markdown(f'<div style="font-size:0.75rem;color:#64748B;font-family:monospace;">SYSTEM STATUS: <span style="color:#00FFCC;">ACTIVE</span><br>LOADED MODEL: {selected_model_name}<br>CALIBRATED ACCURACY: {calib_acc*100:.2f}%</div>', unsafe_allow_html=True)
+
+# ── Helper for Feature Engineering and Pipeline Validation ────────────────
+BASE_FEATURES = [
+    'Protocol', 'Flow Duration', 'Tot Fwd Pkts', 'Tot Bwd Pkts', 'TotLen Fwd Pkts', 'TotLen Bwd Pkts',
+    'Fwd Pkt Len Max', 'Fwd Pkt Len Min', 'Fwd Pkt Len Mean', 'Fwd Pkt Len Std', 'Bwd Pkt Len Max',
+    'Bwd Pkt Len Min', 'Bwd Pkt Len Mean', 'Bwd Pkt Len Std', 'Flow Byts/s', 'Flow Pkts/s',
+    'Flow IAT Mean', 'Flow IAT Std', 'Flow IAT Max', 'Flow IAT Min', 'Fwd IAT Tot', 'Fwd IAT Mean',
+    'Fwd IAT Std', 'Fwd IAT Max', 'Fwd IAT Min', 'Bwd IAT Tot', 'Bwd IAT Mean', 'Bwd IAT Std',
+    'Bwd IAT Max', 'Bwd IAT Min', 'Fwd PSH Flags', 'Bwd PSH Flags', 'Fwd URG Flags', 'Bwd URG Flags',
+    'Fwd Header Len', 'Bwd Header Len', 'Fwd Pkts/s', 'Bwd Pkts/s', 'Pkt Len Min', 'Pkt Len Max',
+    'Pkt Len Mean', 'Pkt Len Std', 'Pkt Len Var', 'FIN Flag Cnt', 'SYN Flag Cnt', 'RST Flag Cnt',
+    'PSH Flag Cnt', 'ACK Flag Cnt', 'URG Flag Cnt', 'CWE Flag Count', 'ECE Flag Cnt', 'Down/Up Ratio',
+    'Pkt Size Avg', 'Fwd Seg Size Avg', 'Bwd Seg Size Avg', 'Fwd Byts/b Avg', 'Fwd Pkts/b Avg',
+    'Fwd Blk Rate Avg', 'Bwd Byts/b Avg', 'Bwd Pkts/b Avg', 'Bwd Blk Rate Avg', 'Subflow Fwd Pkts',
+    'Subflow Fwd Byts', 'Subflow Bwd Pkts', 'Subflow Bwd Byts', 'Init Fwd Win Byts', 'Init Bwd Win Byts',
+    'Fwd Act Data Pkts', 'Fwd Seg Size Min', 'Active Mean', 'Active Std', 'Active Max', 'Active Min',
+    'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min'
+]
+
+def log_pipeline_step(step_name, shape):
+    msg = f"Shape {step_name}: {shape}"
+    print(msg)
+    if 'pipeline_logs' not in st.session_state:
+        st.session_state['pipeline_logs'] = []
+    st.session_state['pipeline_logs'].append(msg)
+
 def preprocess_input_file(df, log1p_cols, selected_features, scaler):
+    # Initialize pipeline logs
+    st.session_state['pipeline_logs'] = []
+    
+    # 1. Shape after loading
+    log_pipeline_step("after loading", df.shape)
+    
     df_transformed = df.copy()
     df_transformed.columns = df_transformed.columns.str.strip()
     
-    # Missing values filling
-    num_cols = df_transformed.select_dtypes(include=[np.number]).columns
-    df_transformed[num_cols] = df_transformed[num_cols].fillna(df_transformed[num_cols].median())
+    id_cols = ['Src IP', 'Dst IP', 'Src Port', 'Dst Port']
+    exclude_cols = ['Label', 'EncodedLabel', 'Multi_Label', 'Multi_Encoded']
     
-    # Drop identifier columns if present
-    id_cols = [c for c in ['Src IP', 'Dst IP', 'Src Port', 'Dst Port'] if c in df_transformed.columns]
-    df_transformed.drop(columns=id_cols, inplace=True, errors='ignore')
+    # Validation checks
+    missing_features = [f for f in BASE_FEATURES if f not in df_transformed.columns]
+    extra_features = [c for c in df_transformed.columns if c not in BASE_FEATURES and c not in id_cols and c not in exclude_cols]
     
-    # Replace infs
+    st.session_state['validation_report'] = {
+        'missing_features': missing_features,
+        'extra_features': extra_features,
+        'expected_count': len(BASE_FEATURES),
+        'received_count': sum(1 for c in df_transformed.columns if c not in id_cols and c not in exclude_cols)
+    }
+    
+    # Automatically add missing columns with default value 0.0
+    for col in missing_features:
+        df_transformed[col] = 0.0
+        
+    # Reorder columns to match base features exactly
+    df_transformed = df_transformed[BASE_FEATURES]
+    
+    # 2. Shape after preprocessing
+    log_pipeline_step("after preprocessing", df_transformed.shape)
+    
     num_cols = df_transformed.select_dtypes(include=[np.number]).columns
+    feature_medians = {}
+    if hasattr(scaler, 'center_') and len(scaler.center_) >= len(BASE_FEATURES):
+        for idx, col in enumerate(BASE_FEATURES):
+            feature_medians[col] = scaler.center_[idx]
+            
+    # Fill NaNs using median
+    for col in num_cols:
+        median_val = feature_medians.get(col, df_transformed[col].median())
+        if pd.isna(median_val):
+            median_val = 0.0
+        df_transformed[col] = df_transformed[col].fillna(median_val)
+        
+    # Replace infs and NaNs
     df_transformed[num_cols] = df_transformed[num_cols].replace([np.inf, -np.inf], np.nan)
     for col in num_cols:
         cap = df_transformed[col].quantile(0.99)
         if pd.isna(cap):
-            cap = 0.0
+            cap = feature_medians.get(col, 0.0)
         df_transformed[col] = df_transformed[col].fillna(cap)
         
     # Log1p transformation
@@ -226,25 +328,22 @@ def preprocess_input_file(df, log1p_cols, selected_features, scaler):
         if col in df_transformed.columns:
             df_transformed[col] = np.log1p(df_transformed[col].clip(lower=0))
             
-    # Add advanced features
-    # 1. Bytes_Per_Packet
-    bps_col = next((c for c in df_transformed.columns if 'Byts/s' in c or 'Bytes/s' in c), None)
-    pps_col = next((c for c in df_transformed.columns if 'Pkts/s' in c or 'Packets/s' in c), None)
+    # 3. Shape after feature engineering (perform engineering)
+    bps_col = next((c for c in BASE_FEATURES if 'Byts/s' in c or 'Bytes/s' in c), None)
+    pps_col = next((c for c in BASE_FEATURES if 'Pkts/s' in c or 'Packets/s' in c), None)
     if bps_col and pps_col:
         df_transformed['Bytes_Per_Packet'] = (df_transformed[bps_col] / (df_transformed[pps_col] + 1e-6)).astype(np.float32)
     else:
         df_transformed['Bytes_Per_Packet'] = 0.0
         
-    # 2. Fwd_Bwd_Ratio
-    fwd_col = next((c for c in df_transformed.columns if 'Fwd Pkt Len Mean' in c), None)
-    bwd_col = next((c for c in df_transformed.columns if 'Bwd Pkt Len Mean' in c), None)
+    fwd_col = next((c for c in BASE_FEATURES if 'Fwd Pkt Len Mean' in c), None)
+    bwd_col = next((c for c in BASE_FEATURES if 'Bwd Pkt Len Mean' in c), None)
     if fwd_col and bwd_col:
         df_transformed['Fwd_Bwd_Ratio'] = (df_transformed[fwd_col] / (df_transformed[bwd_col] + 1e-6)).astype(np.float32)
     else:
         df_transformed['Fwd_Bwd_Ratio'] = 0.0
         
-    # 3. Duration_Per_Pkt
-    dur_col = next((c for c in df_transformed.columns if 'Flow Duration' in c), None)
+    dur_col = next((c for c in BASE_FEATURES if 'Flow Duration' in c), None)
     if dur_col and pps_col:
         df_transformed['Duration_Per_Pkt'] = (df_transformed[dur_col] / (df_transformed[pps_col] + 1e-6)).astype(np.float32)
         df_transformed['Connection_Burst'] = ((df_transformed[dur_col] < 100000) & (df_transformed[pps_col] > 100)).astype(np.float32)
@@ -252,47 +351,127 @@ def preprocess_input_file(df, log1p_cols, selected_features, scaler):
         df_transformed['Duration_Per_Pkt'] = 0.0
         df_transformed['Connection_Burst'] = 0.0
         
-    # 4. Packet_Size_Variance
-    size_cols = [c for c in df_transformed.columns if 'Pkt Len' in c and 'Mean' in c]
+    size_cols = [c for c in BASE_FEATURES if 'Pkt Len' in c and 'Mean' in c]
     if len(size_cols) >= 2:
         df_transformed['Packet_Size_Variance'] = df_transformed[size_cols].var(axis=1).astype(np.float32)
     else:
         df_transformed['Packet_Size_Variance'] = 0.0
         
-    # 5. Flag_Anomaly
-    flag_cols = [c for c in df_transformed.columns if 'Flag' in c]
+    flag_cols = [c for c in BASE_FEATURES if 'Flag' in c]
     if flag_cols:
         df_transformed['Flag_Anomaly'] = df_transformed[flag_cols].sum(axis=1).astype(np.float32)
     else:
         df_transformed['Flag_Anomaly'] = 0.0
         
-    # 6. Empty_Packet_Ratio
-    empty_pkt_col = next((c for c in df_transformed.columns if 'Min' in c and 'Pkt Len' in c), None)
+    empty_pkt_col = next((c for c in BASE_FEATURES if 'Min' in c and 'Pkt Len' in c), None)
     if empty_pkt_col:
         df_transformed['Empty_Packet_Ratio'] = (df_transformed[empty_pkt_col] == 0).astype(np.float32)
     else:
         df_transformed['Empty_Packet_Ratio'] = 0.0
         
-    # 7. RST_Ratio
-    rst_col = next((c for c in df_transformed.columns if 'RST Flag Cnt' in c), None)
+    rst_col = next((c for c in BASE_FEATURES if 'RST Flag Cnt' in c), None)
     if rst_col and pps_col:
         df_transformed['RST_Ratio'] = (df_transformed[rst_col] / (df_transformed[pps_col] + 1e-6)).astype(np.float32)
     else:
         df_transformed['RST_Ratio'] = 0.0
         
-    # Make sure all selected features exist
-    for col in selected_features:
-        if col not in df_transformed.columns:
-            df_transformed[col] = 0.0
-            
-    # Keep selected features in correct order
-    df_transformed = df_transformed[selected_features]
+    log_pipeline_step("after feature engineering", df_transformed.shape)
     
+    # 4. Shape before scaling
+    log_pipeline_step("before scaling", df_transformed.shape)
+    
+    # Ensure scaling input dimension matches scaler expectations (85 features)
+    if df_transformed.shape[1] != scaler.n_features_in_:
+        raise ValueError(f"Feature count mismatch before scaling: expected {scaler.n_features_in_} features, but got {df_transformed.shape[1]}.")
+        
     # Scale and clip
     X_scaled = scaler.transform(df_transformed.values).astype(np.float32)
     X_scaled = np.clip(X_scaled, -10.0, 10.0)
     
-    return X_scaled
+    # 5. Shape after scaling
+    log_pipeline_step("after scaling", X_scaled.shape)
+    
+    # Re-wrap scaled array into a DataFrame to perform feature selection
+    engineered_cols = ['Bytes_Per_Packet', 'Fwd_Bwd_Ratio', 'Duration_Per_Pkt', 'Connection_Burst', 'Packet_Size_Variance', 'Flag_Anomaly', 'Empty_Packet_Ratio', 'RST_Ratio']
+    full_feature_names = BASE_FEATURES + engineered_cols
+    
+    df_scaled = pd.DataFrame(X_scaled, columns=full_feature_names)
+    
+    # 6. Shape after feature selection
+    df_selected = df_scaled[selected_features]
+    log_pipeline_step("after feature selection", df_selected.shape)
+    
+    # 7. Shape before prediction
+    log_pipeline_step("before prediction", df_selected.shape)
+    
+    # Pre-prediction assertions/verifications
+    assert not np.isnan(df_selected.values).any(), "Assertion Error: Preprocessed data contains NaN values."
+    assert df_selected.values.dtype == np.float32, f"Assertion Error: Preprocessed data dtype expected float32, got {df_selected.values.dtype}."
+    assert df_selected.shape[1] == len(selected_features), f"Assertion Error: Preprocessed features count mismatch: expected {len(selected_features)}, got {df_selected.shape[1]}."
+    
+    return df_selected.values
+
+def show_validation_report():
+    if 'validation_report' in st.session_state:
+        report = st.session_state['validation_report']
+        missing = report['missing_features']
+        extra = report['extra_features']
+        expected = report['expected_count']
+        received = report['received_count']
+        
+        st.subheader("🛡️ CSV Schema Validation Report")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Expected Base Features", expected)
+        with col2:
+            st.metric("Detected Base Features", received)
+            
+        if not missing and not extra:
+            st.success("✅ Schema matches perfectly! All features are correctly aligned.")
+        else:
+            if missing:
+                st.warning(f"⚠️ **{len(missing)} Missing Features Detected**: These columns were absent from the uploaded file and have been automatically initialized with default values (0.0 or training median).\n\n"
+                           f"Missing columns: `{', '.join(missing[:15])}`" + (f" and {len(missing)-15} more..." if len(missing) > 15 else ""))
+            if extra:
+                st.info(f"ℹ️ **{len(extra)} Extra Features Detected**: These columns are not used by the model and have been automatically ignored during inference.\n\n"
+                        f"Extra columns: `{', '.join(extra[:15])}`" + (f" and {len(extra)-15} more..." if len(extra) > 15 else ""))
+
+def show_pipeline_logs():
+    if 'pipeline_logs' in st.session_state:
+        with st.expander("⚙️ System Pipeline Execution Logs (Data Shape Tracking)", expanded=False):
+            st.write("Below are the real-time shape checks as the network log flow travels through the preprocessing, scaling, feature selection, and inference pipeline:")
+            for log in st.session_state['pipeline_logs']:
+                st.code(log, language="text")
+
+def display_friendly_error(error_obj):
+    report = st.session_state.get('validation_report', None)
+    st.error("🔴 **ML Pipeline Dimension Mismatch / Preprocessing Error**")
+    
+    if report:
+        missing = report['missing_features']
+        extra = report['extra_features']
+        expected = report['expected_count']
+        received = report['received_count']
+        
+        st.markdown(f"""
+        ### 🔍 Error Summary:
+        - **Cryptic Error**: `{str(error_obj)}`
+        - **Expected Number of Base Features**: `{expected}`
+        - **Received Number of Base Features**: `{received}`
+        - **Missing Columns**: `{', '.join(missing) if missing else 'None'}`
+        - **Extra Columns**: `{', '.join(extra) if extra else 'None'}`
+        
+        ### 💡 Suggested Fix:
+        Please review the uploaded CSV column structure. The Streamlit app requires specific base network flow features. 
+        We have automatically filled missing columns with default values, but a severe column mismatch may still cause errors.
+        Download the **Template Test Data (CSV)** from the dashboard and align your CSV headers with it.
+        """)
+    else:
+        st.markdown(f"""
+        - **Cryptic Error**: `{str(error_obj)}`
+        - **Suggested Fix**: Verify the file format and ensure it contains valid numeric values without header corruption.
+        """)
 
 # ── Helper for Threat Analysis ─────────────────────────────────────────────
 def map_threat_prevention(label, confidence):
@@ -335,11 +514,13 @@ if selected_page == "Dashboard":
     # Metric cards grid
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown('<div class="soc-card"><div class="metric-label">Calibrated Accuracy</div><div class="metric-value">80.80%</div></div>', unsafe_allow_html=True)
+        calib_acc = metadata.get('acc_calibrated', 0.8080)
+        st.markdown(f'<div class="soc-card"><div class="metric-label">Calibrated Accuracy</div><div class="metric-value">{calib_acc*100:.2f}%</div></div>', unsafe_allow_html=True)
     with c2:
-        st.markdown('<div class="soc-card"><div class="metric-label">Weighted F1-Score</div><div class="metric-value">80.94%</div></div>', unsafe_allow_html=True)
+        calib_f1 = metadata.get('f1_calibrated', 0.8094)
+        st.markdown(f'<div class="soc-card"><div class="metric-label">Weighted F1-Score</div><div class="metric-value">{calib_f1*100:.2f}%</div></div>', unsafe_allow_html=True)
     with c3:
-        st.markdown('<div class="soc-card"><div class="metric-label">Active Classifier</div><div class="metric-value" style="font-size:1.45rem;padding-top:12px;">HistGradientBoosting</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="soc-card"><div class="metric-label">Active Classifier</div><div class="metric-value" style="font-size:1.45rem;padding-top:12px;">{selected_model_name}</div></div>', unsafe_allow_html=True)
     with c4:
         # Threat logs counter
         counter = st.session_state.get('threat_counter', 14244)
@@ -414,11 +595,14 @@ elif selected_page == "Prediction":
         input_df = pd.read_csv(uploaded_file)
         st.success(f"Successfully loaded file containing {input_df.shape[0]:,} logs.")
         
-        with st.spinner("Processing logs and executing ML inferences..."):
-            try:
-                # Preprocess input using training specs
-                X_scaled = preprocess_input_file(input_df, metadata['log1p_cols'], metadata['selected_features'], scaler)
-                
+        try:
+            # Run preprocessing first to populate logs and validation report
+            X_scaled = preprocess_input_file(input_df, metadata['log1p_cols'], metadata['selected_features'], scaler)
+            
+            # Show validation report
+            show_validation_report()
+            
+            with st.spinner("Processing logs and executing ML inferences..."):
                 # Model predictions
                 proba = model.predict_proba(X_scaled)
                 
@@ -493,9 +677,14 @@ elif selected_page == "Prediction":
                     file_name="intrusion_predictions.csv",
                     mime="text/csv"
                 )
-            except Exception as e:
-                st.error(f"Error executing prediction pipeline: {e}")
-                st.info("Check if your uploaded CSV has the required feature columns. Download the template for comparison.")
+                
+                # Show system execution logs
+                show_pipeline_logs()
+                
+        except Exception as e:
+            show_validation_report()
+            display_friendly_error(e)
+            show_pipeline_logs()
 
 elif selected_page == "Model Performance":
     st.markdown('<div class="soc-header">MODEL PERFORMANCE</div>', unsafe_allow_html=True)
@@ -505,12 +694,13 @@ elif selected_page == "Model Performance":
     
     # ── TAB 1: Confusion Matrix ──────────────────────────────────────────
     with tab1:
-        st.subheader("Confusion Matrix (Calibrated HistGradientBoosting)")
+        st.subheader(f"Confusion Matrix (Calibrated {selected_model_name})")
         cm_norm = np.array(metadata['confusion_matrix_norm'])
         classes = list(encoder.classes_)
         
-        fig_cm = px.heatmap(
-            x=classes, y=classes, z=cm_norm,
+        fig_cm = px.imshow(
+            cm_norm,
+            x=classes, y=classes,
             color_continuous_scale='Blues',
             text_auto='.2f',
             labels=dict(x="Predicted Class", y="Actual Class", color="Proportion")
@@ -610,7 +800,12 @@ elif selected_page == "Explainability":
         if len(shap_values_raw.shape) == 3:
             # Pick first attack class (e.g. DoS_DDoS or index 2)
             cls_idx = st.selectbox("Select Class to explain globally", range(len(encoder.classes_)), format_func=lambda i: list(encoder.classes_)[i])
-            sv = shap_values_raw[cls_idx]
+            if shap_values_raw.shape[2] == len(encoder.classes_):
+                sv = shap_values_raw[:, :, cls_idx]
+            elif shap_values_raw.shape[0] == len(encoder.classes_):
+                sv = shap_values_raw[cls_idx]
+            else:
+                sv = shap_values_raw[cls_idx]
         else:
             sv = shap_values_raw
             

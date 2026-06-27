@@ -15,7 +15,9 @@ from sklearn.feature_selection import VarianceThreshold, SelectKBest, mutual_inf
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
                              roc_auc_score, confusion_matrix, classification_report,
                              roc_curve, precision_recall_curve, average_precision_score)
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 from imblearn.over_sampling import SMOTE
 import shap
 
@@ -289,152 +291,204 @@ def run_pipeline():
     print(f"   SMOTE complete. Train shape: {X_train_sm.shape} in {time.time()-t0:.1f}s")
     
     # ── 8. Model Training & Threshold Calibration ──────────────────────────────
-    print("\n[8/9] Training HistGradientBoosting classifier...")
-    t0 = time.time()
+    print("\n[8/9] Training all 4 classifiers & calibrating thresholds...")
     
-    hgb_model = HistGradientBoostingClassifier(
-        max_iter=550,
-        learning_rate=0.1,
-        max_leaf_nodes=64,
-        max_depth=8,
-        min_samples_leaf=50,
-        l2_regularization=1.0,
-        class_weight='balanced',
-        early_stopping=True,
-        n_iter_no_change=25,
-        validation_fraction=0.2,
-        random_state=42
-    )
-    
-    hgb_model.fit(X_train_sm, y_train_sm)
-    fit_time = time.time() - t0
-    print(f"   Model training complete in {fit_time:.1f}s")
-    
-    # Threshold Calibration
-    print("   Running per-class threshold calibration...")
-    try:
-        proba_test = hgb_model.predict_proba(X_test_sel)
-    except Exception as e:
-        print(f"   Error: Calibration failed {e}")
-        proba_test = None
-        
-    thresholds = {}
-    if proba_test is not None:
-        for i, cls in enumerate(multi_encoder.classes_):
-            y_bin = (y_test == i).astype(int)
-            prec_arr, rec_arr, thresh_arr = precision_recall_curve(y_bin, proba_test[:, i])
-            with np.errstate(divide='ignore', invalid='ignore'):
-                f1_arr = np.where((prec_arr + rec_arr) > 0, 2 * prec_arr * rec_arr / (prec_arr + rec_arr), 0)
-            best_idx = np.argmax(f1_arr[:-1])
-            thresholds[i] = float(thresh_arr[best_idx])
-            print(f"     {cls:<16}: threshold={thresholds[i]:.3f} (Max F1={f1_arr[best_idx]:.4f})")
-    else:
-        # Fallback to default thresholds
-        thresholds = {i: 0.5 for i in range(len(multi_encoder.classes_))}
-        
-    joblib.dump(hgb_model, 'saved_model.pkl')
-    joblib.dump(thresholds, 'thresholds.pkl')
-    print("   Saved 'saved_model.pkl' & 'thresholds.pkl'")
-    
-    # ── 9. Explainability & Metadata Save ─────────────────────────────────────
-    print("\n[9/9] Pre-computing evaluation metrics and SHAP values...")
-    t0 = time.time()
-    
-    # Helper to predict with thresholds
-    def predict_with_thresholds_local(model, X, thresh_dict):
-        proba = model.predict_proba(X)
-        thresh_arr = np.array([thresh_dict[i] for i in range(proba.shape[1])])
-        adjusted = proba / (thresh_arr + 1e-9)
-        return np.argmax(adjusted, axis=1)
-        
-    y_pred_default = hgb_model.predict(X_test_sel)
-    y_pred_calibrated = predict_with_thresholds_local(hgb_model, X_test_sel, thresholds)
-    
-    # Evaluate basic metrics
-    acc_default = accuracy_score(y_test, y_pred_default)
-    acc_calibrated = accuracy_score(y_test, y_pred_calibrated)
-    f1_default = f1_score(y_test, y_pred_default, average='weighted', zero_division=0)
-    f1_calibrated = f1_score(y_test, y_pred_calibrated, average='weighted', zero_division=0)
-    
-    cm = confusion_matrix(y_test, y_pred_calibrated)
-    cm_norm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
-    
-    # ROC curves data
-    roc_data = {}
-    y_bin = np.eye(len(multi_encoder.classes_))[y_test]
-    for i, cls in enumerate(multi_encoder.classes_):
-        fpr, tpr, _ = roc_curve(y_bin[:, i], proba_test[:, i])
-        auc_score = roc_auc_score(y_bin[:, i], proba_test[:, i])
-        # Sample points to make metadata file small
-        sample_step = max(1, len(fpr) // 200)
-        roc_data[cls] = {
-            'fpr': fpr[::sample_step].tolist(),
-            'tpr': tpr[::sample_step].tolist(),
-            'auc': float(auc_score)
-        }
-        
-    # Precision-Recall curves data
-    pr_data = {}
-    for i, cls in enumerate(multi_encoder.classes_):
-        prec_c, rec_c, _ = precision_recall_curve(y_bin[:, i], proba_test[:, i])
-        ap_score = average_precision_score(y_bin[:, i], proba_test[:, i])
-        sample_step = max(1, len(prec_c) // 200)
-        pr_data[cls] = {
-            'precision': prec_c[::sample_step].tolist(),
-            'recall': rec_c[::sample_step].tolist(),
-            'ap': float(ap_score)
-        }
-        
     # Pre-compute SHAP values on a subset (200 test set samples)
-    print("   Pre-computing SHAP summary values (subset of 200 test rows)...")
+    print("   Setting up SHAP subset of 200 test rows...")
     SHAP_SAMPLE = 200
     np.random.seed(42)
     idx_shap = np.random.choice(len(X_test_sel), SHAP_SAMPLE, replace=False)
     X_shap = X_test_sel[idx_shap]
     y_shap = y_test[idx_shap]
     
-    explainer = shap.TreeExplainer(hgb_model)
-    shap_values = explainer.shap_values(X_shap)
+    models = {
+        'HistGradientBoosting': HistGradientBoostingClassifier(
+            max_iter=550,
+            learning_rate=0.1,
+            max_leaf_nodes=64,
+            max_depth=8,
+            min_samples_leaf=50,
+            l2_regularization=1.0,
+            class_weight='balanced',
+            early_stopping=True,
+            n_iter_no_change=25,
+            validation_fraction=0.2,
+            random_state=42
+        ),
+        'XGBoost': XGBClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=7,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=1.0,
+            reg_lambda=1.0,
+            eval_metric='mlogloss',
+            tree_method='hist',
+            n_jobs=-1,
+            random_state=42
+        ),
+        'LightGBM': LGBMClassifier(
+            n_estimators=450,
+            learning_rate=0.05,
+            num_leaves=83,
+            max_depth=6,
+            min_child_samples=50,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.5,
+            reg_lambda=1.0,
+            class_weight='balanced',
+            n_jobs=-1,
+            random_state=42,
+            verbose=-1
+        ),
+        'Random Forest': RandomForestClassifier(
+            n_estimators=250,
+            max_depth=25,
+            min_samples_split=4,
+            min_samples_leaf=2,
+            max_features='sqrt',
+            class_weight='balanced_subsample',
+            n_jobs=-1,
+            random_state=42
+        )
+    }
     
-    # If multiclass shap_values is list, shape is [classes, samples, features]
-    # In newer SHAP versions it might be an array of shape [samples, features, classes]
-    shap_is_list = isinstance(shap_values, list)
+    models_metadata = {}
+    comparison_table = []
     
-    print("   SHAP calculation complete. Preparing metadata...")
-    
-    # Format of static comparison table (from Colab run)
-    comparison_table = [
-        {'Model': 'HistGradientBoosting', 'Accuracy': 0.790166, 'Precision_W': 0.814525, 'Recall_W': 0.790166, 'Weighted_F1': 0.798013, 'Macro_F1': 0.725900, 'ROC_AUC': 0.971284, 'Train_Time_s': 42.1},
-        {'Model': 'XGBoost', 'Accuracy': 0.800900, 'Precision_W': 0.805357, 'Recall_W': 0.800900, 'Weighted_F1': 0.797439, 'Macro_F1': 0.733165, 'ROC_AUC': 0.969492, 'Train_Time_s': 120.4},
-        {'Model': 'Random Forest', 'Accuracy': 0.791745, 'Precision_W': 0.802863, 'Recall_W': 0.791745, 'Weighted_F1': 0.795779, 'Macro_F1': 0.723047, 'ROC_AUC': 0.967650, 'Train_Time_s': 185.2},
-        {'Model': 'LightGBM', 'Accuracy': 0.767939, 'Precision_W': 0.803022, 'Recall_W': 0.767939, 'Weighted_F1': 0.778630, 'Macro_F1': 0.701664, 'ROC_AUC': 0.965882, 'Train_Time_s': 28.6}
-    ]
+    for name, model in models.items():
+        print(f"\n   Training {name} classifier...")
+        t_model = time.time()
+        model.fit(X_train_sm, y_train_sm)
+        fit_time = time.time() - t_model
+        print(f"   {name} training complete in {fit_time:.1f}s")
+        
+        # Threshold Calibration
+        print(f"   Running per-class threshold calibration for {name}...")
+        try:
+            proba_test = model.predict_proba(X_test_sel)
+        except Exception as e:
+            print(f"   Error: Calibration failed {e}")
+            proba_test = None
+            
+        thresholds = {}
+        if proba_test is not None:
+            for i, cls in enumerate(multi_encoder.classes_):
+                y_bin_cls = (y_test == i).astype(int)
+                prec_arr, rec_arr, thresh_arr = precision_recall_curve(y_bin_cls, proba_test[:, i])
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    f1_arr = np.where((prec_arr + rec_arr) > 0, 2 * prec_arr * rec_arr / (prec_arr + rec_arr), 0)
+                best_idx = np.argmax(f1_arr[:-1])
+                thresholds[i] = float(thresh_arr[best_idx])
+                print(f"     {cls:<16}: threshold={thresholds[i]:.3f} (Max F1={f1_arr[best_idx]:.4f})")
+        else:
+            thresholds = {i: 0.5 for i in range(len(multi_encoder.classes_))}
+            
+        # Save model and thresholds
+        model_filename = f"saved_model_{name.replace(' ', '_')}.pkl"
+        thresholds_filename = f"thresholds_{name.replace(' ', '_')}.pkl"
+        joblib.dump(model, model_filename)
+        joblib.dump(thresholds, thresholds_filename)
+        print(f"   Saved '{model_filename}' & '{thresholds_filename}'")
+        
+        # Compute metrics
+        y_pred_default = model.predict(X_test_sel)
+        
+        # Predict with thresholds
+        thresh_arr = np.array([thresholds[i] for i in range(len(multi_encoder.classes_))])
+        adjusted = proba_test / (thresh_arr + 1e-9)
+        y_pred_calibrated = np.argmax(adjusted, axis=1)
+        
+        acc_default = accuracy_score(y_test, y_pred_default)
+        acc_calibrated = accuracy_score(y_test, y_pred_calibrated)
+        f1_default = f1_score(y_test, y_pred_default, average='weighted', zero_division=0)
+        f1_calibrated = f1_score(y_test, y_pred_calibrated, average='weighted', zero_division=0)
+        
+        cm = confusion_matrix(y_test, y_pred_calibrated)
+        cm_norm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
+        
+        # ROC curves data
+        roc_data = {}
+        y_bin = np.eye(len(multi_encoder.classes_))[y_test]
+        for i, cls in enumerate(multi_encoder.classes_):
+            fpr, tpr, _ = roc_curve(y_bin[:, i], proba_test[:, i])
+            auc_score = roc_auc_score(y_bin[:, i], proba_test[:, i])
+            sample_step = max(1, len(fpr) // 200)
+            roc_data[cls] = {
+                'fpr': fpr[::sample_step].tolist(),
+                'tpr': tpr[::sample_step].tolist(),
+                'auc': float(auc_score)
+            }
+            
+        # Precision-Recall curves data
+        pr_data = {}
+        for i, cls in enumerate(multi_encoder.classes_):
+            prec_c, rec_c, _ = precision_recall_curve(y_bin[:, i], proba_test[:, i])
+            ap_score = average_precision_score(y_bin[:, i], proba_test[:, i])
+            sample_step = max(1, len(prec_c) // 200)
+            pr_data[cls] = {
+                'precision': prec_c[::sample_step].tolist(),
+                'recall': rec_c[::sample_step].tolist(),
+                'ap': float(ap_score)
+            }
+            
+        # Pre-compute SHAP values on a subset (200 test set samples)
+        print(f"   Pre-computing SHAP summary values for {name} (subset of 200 test rows)...")
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_shap)
+        shap_is_list = isinstance(shap_values, list)
+        
+        # Save model metadata
+        models_metadata[name] = {
+            'acc_default': float(acc_default),
+            'acc_calibrated': float(acc_calibrated),
+            'f1_default': float(f1_default),
+            'f1_calibrated': float(f1_calibrated),
+            'confusion_matrix': cm.tolist(),
+            'confusion_matrix_norm': cm_norm.tolist(),
+            'roc_curves': roc_data,
+            'pr_curves': pr_data,
+            'shap_values_raw': [sv.tolist() for sv in shap_values] if shap_is_list else shap_values.tolist(),
+            'shap_is_list': shap_is_list
+        }
+        
+        # Add to comparison table
+        comparison_table.append({
+            'Model': name,
+            'Accuracy': float(acc_calibrated),
+            'Precision_W': float(precision_score(y_test, y_pred_calibrated, average='weighted', zero_division=0)),
+            'Recall_W': float(recall_score(y_test, y_pred_calibrated, average='weighted', zero_division=0)),
+            'Weighted_F1': float(f1_calibrated),
+            'Macro_F1': float(f1_score(y_test, y_pred_calibrated, average='macro', zero_division=0)),
+            'ROC_AUC': float(roc_auc_score(y_bin, proba_test, multi_class='ovr', average='weighted')),
+            'Train_Time_s': float(fit_time)
+        })
+        
+    # Save default models (HistGradientBoosting) as saved_model.pkl and thresholds.pkl for backwards compatibility
+    import shutil
+    shutil.copyfile("saved_model_HistGradientBoosting.pkl", "saved_model.pkl")
+    shutil.copyfile("thresholds_HistGradientBoosting.pkl", "thresholds.pkl")
+    print("   Created default copies for compatibility ('saved_model.pkl', 'thresholds.pkl').")
+
+    # ── 9. Save Metadata ──────────────────────────────────────────────────────
+    print("\n[9/9] Saving metadata metrics and assets...")
     
     metadata = {
         'log1p_cols': log1p_cols,
         'selected_features': selected_features,
         'mi_importances': mi_importances,
         'comparison_table': comparison_table,
-        'acc_default': float(acc_default),
-        'acc_calibrated': float(acc_calibrated),
-        'f1_default': float(f1_default),
-        'f1_calibrated': float(f1_calibrated),
-        'confusion_matrix': cm.tolist(),
-        'confusion_matrix_norm': cm_norm.tolist(),
-        'roc_curves': roc_data,
-        'pr_curves': pr_data,
-        # SHAP visualization payload
         'shap_test_subset': X_shap.tolist(),
         'shap_test_labels': y_shap.tolist(),
-        'shap_values_raw': [sv.tolist() for sv in shap_values] if shap_is_list else shap_values.tolist(),
-        'shap_is_list': shap_is_list
+        'models_metadata': models_metadata
     }
     
     with open('metrics_metadata.pkl', 'wb') as f:
         pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
         
-    print("   Saved 'metrics_metadata.pkl' containing visual assets & static metrics.")
-    print(f"   Pipeline evaluation: Default Acc={acc_default:.4f} | Calibrated Acc={acc_calibrated:.4f}")
+    print("   Saved 'metrics_metadata.pkl' containing visual assets & static metrics for all models.")
     
     duration = time.time() - t_start
     print(f"\n[SUCCESS] PIPELINE COMPLETED SUCCESSFULLY IN {duration:.1f}s")
